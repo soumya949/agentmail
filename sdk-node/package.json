@@ -1,0 +1,28 @@
+{
+  "name": "openbox-agentmail-sdk",
+  "version": "0.1.0",
+  "description": "OpenBox governance for AgentMail agents (TypeScript port of openbox-agentmail-sdk-python).",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "node --experimental-transform-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "agentmail": "0.5.26",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "peerDependencies": {
+    "agentmail": "*"
+  },
+  "peerDependenciesMeta": {
+    "agentmail": {
+      "optional": true
+    }
+  }
+}

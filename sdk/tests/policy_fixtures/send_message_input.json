@@ -1,0 +1,29 @@
+{
+  "action": "send_message",
+  "action_class": "send",
+  "attachments": [],
+  "bcc": [],
+  "cc": [],
+  "content_sha256": "3b566e15fa8fd041e3851ffd4e58e46b8b8d578d68424f59fd59436ce1ede105",
+  "draft_id": null,
+  "external_recipients": true,
+  "html": null,
+  "html_present": false,
+  "inbox_id": "inbox_1",
+  "labels": [],
+  "message_id": null,
+  "pod_id": null,
+  "recipient_count": 1,
+  "recipient_domains": [
+    "example.com"
+  ],
+  "reply_to": [],
+  "send_at": null,
+  "subject": "hi",
+  "surface": "rest",
+  "text": "hello",
+  "thread_id": null,
+  "to": [
+    "alice@example.com"
+  ]
+}

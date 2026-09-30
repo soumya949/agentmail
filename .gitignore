@@ -1,0 +1,49 @@
+# ── secrets — never commit ───────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# ── local tooling / editor config ───────────────────────────────────────────
+.devin/
+.vscode/
+.idea/
+
+# ── virtual environments ────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+node_modules/
+
+# ── build artifacts ─────────────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.whl
+*.tar.gz
+
+# ── caches ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.log
+
+# ── third-party source, vendored for reference only ─────────────────────────
+# Full copies of other projects' repositories. They are not ours to
+# redistribute, and openbox-sdk-python installs from PyPI anyway.
+ref/
+
+# ── vendored upstream documentation (not ours to republish) ─────────────────
+openbox-docs.pdf
+openbox-docs.txt
+openbox-agentmail-sdk-prd copy.md
+
+# ── OS noise ────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
