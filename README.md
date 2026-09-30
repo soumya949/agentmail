@@ -480,8 +480,10 @@ governed process can reach it.
 ungoverned email. You can change this with `OPENBOX_ON_API_ERROR=fail_open`, but
 the safe default is to stop.
 
-**The Node/TypeScript SDK in [`sdk-node/`](sdk-node/) is not ready.** It has
-known defects that can make an agent hang permanently. Use the Python SDK.
+**The Node/TypeScript SDK in [`sdk-node/`](sdk-node/) is usable but behind.**
+The defects that could hang an agent are fixed, but it does not yet have
+governed inbound as an activity, `emit_trigger`, session scoping, or a
+WebSocket listener. For the full feature set, use the Python SDK.
 
 ---
 

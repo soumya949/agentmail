@@ -10,7 +10,7 @@ import {
   GovernanceAPIError,
   UncataloguedActionError,
 } from "../src/errors.ts";
-import { FakeCore, makeMail, SEND_ARGS } from "./helpers.ts";
+import { FakeCore, INBOUND_EVENT, makeMail, SEND_ARGS } from "./helpers.ts";
 
 function makeAgent(core: FakeCore, mail = makeMail(), settings: any = {}, govOpts: any = {}) {
   const client = new OpenBoxClient({
@@ -116,15 +116,80 @@ test("constrain strip_attachments is applied to the real call", async () => {
   assert.deepEqual(mail.calls[0].request.attachments, []);
 });
 
-test("constrain violation escalates to approval", async () => {
+// An unsatisfiable CONSTRAIN fails closed and NEVER polls. Core registers an
+// approval for REQUIRE_APPROVAL only, so polling on a CONSTRAIN waits on an
+// approval that will never exist — with maxWaitMs unset that hangs forever.
+// Verified live against a real OpenBox Core (Sep 2026).
+
+test("constrain violation fails closed and never polls", async () => {
   const core = new FakeCore(
     {},
     { verdict: "constrain", constraints: [{ type: "allowed_domains", domains: ["corp.example"] }] },
-    { action: "allow" }, {}, {},
   );
+  const { agent, mail } = makeAgent(core);
+  await assert.rejects(
+    () => agent.inboxes.messages.send("inbox_1", SEND_ARGS),
+    (e: any) => e.constructor.name === "AgentMailBlockedError" && /could not be satisfied/.test(e.message),
+  );
+  assert.equal(core.approvalRequests.length, 0, "must not poll for an approval Core never registers");
+  assert.equal(mail.calls.length, 0, "AgentMail must not be called");
+});
+
+test("bare constrain fails closed and never polls", async () => {
+  const core = new FakeCore({}, { verdict: "constrain" });
+  const { agent, mail } = makeAgent(core);
+  await assert.rejects(
+    () => agent.inboxes.messages.send("inbox_1", SEND_ARGS),
+    (e: any) => e.constructor.name === "AgentMailBlockedError" && /without any constraints/.test(e.message),
+  );
+  assert.equal(core.approvalRequests.length, 0);
+  assert.equal(mail.calls.length, 0);
+});
+
+test("Core's bare-string constraints are understood, not reported as unknown", async () => {
+  // Core sends ["run_in_sandbox"] — strings, not objects.
+  const core = new FakeCore({}, { verdict: "constrain", constraints: ["run_in_sandbox"] });
+  const { agent, mail } = makeAgent(core);
+  await assert.rejects(
+    () => agent.inboxes.messages.send("inbox_1", SEND_ARGS),
+    (e: any) => /no meaning for an email action/.test(e.message),
+  );
+  assert.equal(core.approvalRequests.length, 0);
+  assert.equal(mail.calls.length, 0);
+});
+
+test("string form of a real constraint still applies", async () => {
+  const core = new FakeCore({}, { verdict: "constrain", constraints: ["strip_attachments"] }, {});
+  const { agent, mail } = makeAgent(core);
+  await agent.inboxes.messages.send("inbox_1", { ...SEND_ARGS, attachments: [{ filename: "a.pdf" }] });
+  assert.deepEqual(mail.calls[0].request.attachments, []);
+});
+
+test("inbound constrain fails closed and never polls", async () => {
+  const core = new FakeCore({}, { verdict: "constrain", constraints: ["run_in_sandbox"] });
   const { agent } = makeAgent(core);
-  await agent.inboxes.messages.send("inbox_1", SEND_ARGS);
-  assert.equal(core.approvalRequests.length, 1);
+  await assert.rejects(
+    () => agent.governor.screenInbound(INBOUND_EVENT, { enforce: true }),
+    (e: any) => /cannot be rewritten/.test(e.message),
+  );
+  assert.equal(core.approvalRequests.length, 0);
+});
+
+test("a failed AgentMail call is recorded, not dropped", async () => {
+  // Core rejects an ActivityCompleted carrying a top-level `error` with HTTP
+  // 400 and drops the whole event, so the failure must ride inside
+  // activity_output instead.
+  const core = new FakeCore({}, {}, {});
+  const mail = makeMail();
+  const { agent } = makeAgent(core, mail);
+  mail.inboxes.messages.send = () => Promise.reject(new Error("x".repeat(4000)));
+  await assert.rejects(() => agent.inboxes.messages.send("inbox_1", SEND_ARGS));
+  const completed = core.payloads.filter((p: any) => p.event_type === "ActivityCompleted");
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0].error, undefined, "must NOT send a top-level error field");
+  assert.equal(completed[0].failed, true);
+  assert.equal(completed[0].activity_output.status, "failed");
+  assert.ok(completed[0].activity_output.error.length < 1100, "error text must be bounded");
 });
 
 test("guardrail redacted_input is applied to the real call", async () => {

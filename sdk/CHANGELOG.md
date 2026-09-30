@@ -87,8 +87,10 @@ offline suite first.
   severity.
 - Governance covers calls made *through this SDK*. The AgentMail console, raw
   API-key calls and the hosted MCP used without this proxy are not governed.
-- The Node/TypeScript SDK in `sdk-node/` has not received the fixes above and
-  should not be used yet.
+- The Node/TypeScript SDK in `sdk-node/` has the fixes above, but not the
+  feature set: no inbound-as-activity (it screens the pushed copy only, never
+  fetching the authoritative message), no `emit_trigger`, no session scoping
+  and no WebSocket transport. Use the Python SDK for full parity.
 
 [Unreleased]: https://github.com/soumya949/agentmail/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/soumya949/agentmail/releases/tag/v0.1.0

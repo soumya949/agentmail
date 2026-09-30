@@ -1,4 +1,16 @@
-/** CONSTRAIN vocabulary — mirrors sdk/src/openbox_agentmail/constraints.py. */
+/** CONSTRAIN vocabulary — mirrors sdk/src/openbox_agentmail/constraints.py.
+ *
+ *  Core sends constraints as BARE STRINGS (e.g. ["run_in_sandbox"]) as well as
+ *  objects, so strings are normalised to {type: <string>} before lookup.
+ *
+ *  A constraint that cannot be satisfied makes the caller FAIL CLOSED — the
+ *  governor turns ConstraintViolation into AgentMailBlockedError. It never
+ *  escalates to approval: Core registers an approval for REQUIRE_APPROVAL
+ *  only, so polling on a CONSTRAIN waits forever.
+ *
+ *  Reality check: the OpenBox rule builder cannot author constraints at all —
+ *  a CONSTRAIN rule only ever emits ["run_in_sandbox"], which is meaningless
+ *  for email. Use REQUIRE APPROVAL or BLOCK for mail. */
 
 import { domainOf } from "./contracts.ts";
 
@@ -18,14 +30,20 @@ function recipientDomains(args: Record<string, unknown>): Set<string> {
   return out;
 }
 
+/** Core-level directives aimed at code execution — valid constraints, just
+ *  meaningless for "send an email". Naming them gives a far better error. */
+const NOT_APPLICABLE_TO_EMAIL = new Set(["run_in_sandbox", "sandbox", "dry_run"]);
+
 export function applyConstraints(
   args: Record<string, unknown>,
-  constraints: Array<Record<string, unknown>> | null | undefined,
+  constraints: Array<Record<string, unknown> | string> | null | undefined,
 ): [Record<string, unknown>, string[]] {
   if (!constraints?.length) return [args, []];
   const out = { ...args };
   const applied: string[] = [];
-  for (const c of constraints) {
+  for (const raw of constraints) {
+    const c: Record<string, unknown> = typeof raw === "string" ? { type: raw } : raw;
+    if (c === null || typeof c !== "object") throw new ConstraintViolation(`unrecognised constraint ${String(raw)}`);
     const type = String(c?.type ?? "");
     if (type === "max_recipients") {
       const cap = c.count;
@@ -49,6 +67,11 @@ export function applyConstraints(
       applied.push(`force_bcc=${address}`);
     } else if (type === "require_approval" || type === "approval") {
       throw new ConstraintViolation("constraint requires human approval");
+    } else if (NOT_APPLICABLE_TO_EMAIL.has(type)) {
+      throw new ConstraintViolation(
+        `constraint '${type}' has no meaning for an email action — there is no code to run. ` +
+          "Use REQUIRE APPROVAL or BLOCK for mail instead",
+      );
     } else {
       throw new ConstraintViolation(`unknown constraint type ${type}`);
     }

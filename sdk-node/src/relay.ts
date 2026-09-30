@@ -69,6 +69,11 @@ export class WebhookAuth {
 export class MemoryDedupe {
   private seen = new Map<string, number>();
   constructor(private ttlSeconds = 86400) {}
+  /** Undo seenOrAdd after a transient failure, so the sender's retry is
+   *  processed rather than dropped as a duplicate. */
+  async forget(id: string): Promise<void> {
+    this.seen.delete(id);
+  }
   async seenOrAdd(id: string): Promise<boolean> {
     const now = Date.now() / 1000;
     for (const [k, exp] of this.seen) if (exp < now) this.seen.delete(k);
@@ -88,6 +93,13 @@ export class InboundRelay {
       onBlocked?: (event: Record<string, any>, err: Error) => unknown;
     },
   ) {}
+
+  /** Created ONCE. Building it per request (the previous behaviour) meant the
+   *  default configuration never deduplicated anything. */
+  private defaultDedupe = new MemoryDedupe();
+  private get dedupe(): MemoryDedupe {
+    return this.opts.dedupe ?? this.defaultDedupe;
+  }
 
   private async blocked(event: Record<string, any>, e: Error, reason: string): Promise<RelayResponse> {
     try {
@@ -125,9 +137,15 @@ export class InboundRelay {
 
     const eventId = event.event_id;
     if (typeof eventId === "string" && eventId) {
-      if (await (this.opts.dedupe ?? new MemoryDedupe()).seenOrAdd(eventId))
+      if (await this.dedupe.seenOrAdd(eventId))
         return { status: 200, body: { status: "duplicate" } };
     }
+    // A 5xx asks AgentMail to redeliver, so the id must not stay in dedupe —
+    // otherwise that retry is dropped as a duplicate and the mail is lost.
+    const release = async (r: RelayResponse) => {
+      if (r.status >= 500 && typeof eventId === "string" && eventId) await this.dedupe.forget(eventId);
+      return r;
+    };
 
     const enforce = CONTENT_EVENTS.has(event.event_type);
     let result: EvaluationResult;
@@ -142,7 +160,7 @@ export class InboundRelay {
       if (e instanceof ApprovalRejectedError || e instanceof ApprovalExpiredError || e instanceof ApprovalTimeoutError)
         return this.blocked(event, e as Error, `approval: ${e}`);
       if (e instanceof GovernanceAPIError)
-        return { status: 503, body: { error: `governance unavailable: ${e}` } };
+        return release({ status: 503, body: { error: `governance unavailable: ${e}` } });
       throw e;
     }
 
@@ -152,7 +170,7 @@ export class InboundRelay {
     try {
       await this.opts.handler?.(inbound);
     } catch {
-      return { status: 500, body: { error: "handler failed" } };
+      return release({ status: 500, body: { error: "handler failed" } });
     }
     return { status: 200, body: { status: "delivered", verdict: result.verdict } };
   }

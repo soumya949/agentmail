@@ -80,7 +80,15 @@ Full port: `catalog.ts`, `contracts.ts`, `constraints.ts`, `errors.ts`, `core.ts
 - Content events (webhook + websocket) are now an activity, not only a signal: `ActivityStarted` screens the pushed email (sender, SPF/DKIM headers, subject, body) → approval with a **real activity_id** (the SignalReceived path polled with `""`) → `messages.get` fetched *inside* the activity (HTTP GET child spans on the dashboard) → `ActivityCompleted` output guardrails on the fetched copy → handler gets the fetched, redacted message (`GovernedInbound.activity_id`).
 - `fetch_on_receive=True` default on `InboundRelay` / `WebsocketInbound`; `False` keeps SignalReceived. Status events stay signals. Governor API: `receive_inbound` / `areceive_inbound` → `ReceivedMessage`.
 - Fail closed everywhere: Core outage or fetch failure (`InboundFetchError`) → never delivered. Webhook: 503; **fixed** a pre-existing bug where the 503/500 left the event_id in dedupe so AgentMail's retry was dropped as "duplicate" (`MemoryDedupe.forget`). WebSocket: local `screen_retries` then `on_dead_letter(event, error)`.
-- Not yet ported to `sdk-node/relay.ts` (still SignalReceived). **All of P10 is likewise Python-only** - the Node SDK still carries bugs 1-5 above.
+- Not yet ported to `sdk-node/relay.ts` (still SignalReceived).
+
+**Node parity (Sep 30 2026):** the P10 *fixes* are ported — bugs 2-5 above are
+closed in `sdk-node/` (it never had bug 1, since it never gated polling on
+`approval_id`), plus two Node-only defects: the default dedupe was rebuilt per
+request so it never deduplicated, and a 5xx left the id in dedupe so AgentMail's
+redelivery was swallowed. 44 tests, `tsc` clean. The P9/P10 *features* are still
+Python-only: no `receive_inbound`/fetch-on-receive, no `emit_trigger`, no
+session scoping, no WebSocket transport.
 
 ### P10 - Live hardening (Sep 30 2026): five bugs only a real Core could expose
 

@@ -89,3 +89,33 @@ test("secret rotation accepts old and new", () => {
   assert.ok(auth.check({ authorization: "Bearer new" }));
   assert.ok(!auth.check({ authorization: "Bearer bad" }));
 });
+
+// Regressions: the default dedupe used to be rebuilt per request (so it never
+// deduplicated — makeRelay injects one, which is why this went unnoticed), and
+// a 5xx left the id in dedupe, so AgentMail's redelivery was dropped as a
+// duplicate and the mail was lost.
+
+test("default dedupe (none injected) actually deduplicates", async () => {
+  const seen: GovernedInbound[] = [];
+  const { relay } = makeRelay(new FakeCore(), {
+    dedupe: undefined,
+    handler: (i: GovernedInbound) => { seen.push(i); },
+  });
+  await relay.handle(AUTH, body());
+  const r2 = await relay.handle(AUTH, body());
+  assert.equal(r2.body.status, "duplicate");
+  assert.equal(seen.length, 1);
+});
+
+test("a 5xx releases the event id so the retry is processed", async () => {
+  let calls = 0;
+  const { relay } = makeRelay(new FakeCore(), {
+    dedupe: undefined,
+    handler: () => { calls += 1; if (calls === 1) throw new Error("app down"); },
+  });
+  const first = await relay.handle(AUTH, body());
+  assert.equal(first.status, 500);
+  const retry = await relay.handle(AUTH, body());
+  assert.equal(retry.body.status, "delivered", "redelivery must not be swallowed as duplicate");
+  assert.equal(calls, 2);
+});

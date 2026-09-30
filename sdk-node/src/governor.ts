@@ -19,6 +19,24 @@ import {
 
 const SDK_VERSION = "0.1.0";
 
+/** Bounded, wire-safe text for a failure record. Some SDK errors stringify to
+ *  kilobytes of HTTP headers, which bloats or breaks the event. */
+const MAX_ERROR_CHARS = 1000;
+export function errorText(e: unknown): string {
+  const name = e instanceof Error ? e.constructor.name : typeof e;
+  let detail: string;
+  try {
+    detail = e instanceof Error ? e.message : String(e);
+  } catch {
+    detail = "<unprintable>";
+  }
+  let text = detail ? `${name}: ${detail}` : name;
+  // eslint-disable-next-line no-control-regex
+  text = text.replace(/[\u0000-\u001f\u007f]/g, " ");
+  if (text.length > MAX_ERROR_CHARS) text = text.slice(0, MAX_ERROR_CHARS) + " ...[truncated]";
+  return text;
+}
+
 export interface PendingApproval {
   approvalId: string | null;
   activityId: string;
@@ -306,16 +324,28 @@ export class MailGovernor {
     this.checkFallback(spec, r1);
 
     let execArgs = this.redactArgs(args, r1);
-    let needsApproval = r1.verdict === "require_approval";
+    const needsApproval = r1.verdict === "require_approval";
     if (r1.verdict === "constrain" && isWrite(spec.actionClass)) {
-      if (!r1.constraints?.length) needsApproval = true;
-      else {
-        try {
-          [execArgs] = applyConstraints(execArgs, r1.constraints);
-        } catch (e) {
-          if (!(e instanceof ConstraintViolation)) throw e;
-          needsApproval = true;
-        }
+      // A CONSTRAIN we cannot apply must fail closed HERE. It must not fall
+      // through to the approval poll: Core registers an approval for
+      // REQUIRE_APPROVAL only, so polling on CONSTRAIN waits on an approval
+      // that will never exist — and with maxWaitMs unset that hangs forever.
+      if (!r1.constraints?.length)
+        throw new AgentMailBlockedError(
+          `policy returned CONSTRAIN for ${spec.activityType} without any constraints, so there is ` +
+            "nothing to apply and the call cannot be made compliant. Use REQUIRE APPROVAL or BLOCK instead",
+          spec.activityType,
+          r1.policyId ?? null,
+        );
+      try {
+        [execArgs] = applyConstraints(execArgs, r1.constraints);
+      } catch (e) {
+        if (!(e instanceof ConstraintViolation)) throw e;
+        throw new AgentMailBlockedError(
+          `policy returned CONSTRAIN for ${spec.activityType} but it could not be satisfied: ${e.message}`,
+          spec.activityType,
+          r1.policyId ?? null,
+        );
       }
     }
 
@@ -336,7 +366,10 @@ export class MailGovernor {
           task_queue: inboxId,
           activity_id: activityId,
           activity_type: spec.activityType,
-          error: String(e),
+          // NOT a top-level `error`: Core rejects such an ActivityCompleted with
+          // HTTP 400 and drops the whole event, so the failure is never recorded.
+          failed: true,
+          activity_output: { action: spec.action, status: "failed", error: errorText(e) },
           source: EVENT_SOURCE,
           ...this.baseExtra(inboxId),
         });
@@ -419,7 +452,16 @@ export class MailGovernor {
       const reasons = (r.guardrails.reasons ?? []).map((x) => (typeof x === "string" ? x : x.reason ?? "")).filter(Boolean);
       throw new GuardrailsValidationError(reasons);
     }
-    if (r.verdict === "require_approval" || r.verdict === "constrain") {
+    if (r.verdict === "constrain")
+      throw new AgentMailBlockedError(
+        "policy returned CONSTRAIN for inbound mail, which cannot be applied — a received " +
+          "message cannot be rewritten. Use REQUIRE APPROVAL or BLOCK instead",
+        "agentmail.receive_message",
+        r.policyId ?? null,
+      );
+    if (r.verdict === "require_approval") {
+      if (!(this.opts.hitl?.enabled ?? true))
+        throw new ApprovalRejectedError("Approval required but HITL polling is disabled");
       await this.client.waitForApproval(this.workflowId ?? "", this.runId ?? "", "", {
         pollIntervalMs: this.opts.hitl?.pollIntervalMs ?? 1000,
         maxWaitMs: this.opts.hitl?.maxWaitMs ?? null,
