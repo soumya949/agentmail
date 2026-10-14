@@ -116,6 +116,18 @@ async def test_block_on_started_skips_fetch_and_handler(core, fake_mail):
     assert resp.status == 200 and resp.body["status"] == "blocked"
     assert seen == [] and fake_mail.calls == []
     assert isinstance(blocked[0], AgentMailBlockedError)
+    _assert_receive_closed_failed(core)
+
+
+def _assert_receive_closed_failed(core):
+    """A refused receive_message is still completed (as failed) on its own id."""
+    started = _started(core)[-1]
+    closing = [p for p in core.lifecycle_payloads
+               if p.get("event_type") == "ActivityCompleted"
+               and p.get("activity_id") == started["activity_id"]]
+    assert len(closing) == 1
+    assert closing[0]["status"] == "failed"
+    assert closing[0]["activity_input"] == started["activity_input"]
 
 
 async def test_block_on_completed_after_fetch_never_reaches_handler(core, fake_mail):
@@ -208,6 +220,7 @@ async def test_require_approval_rejected_never_fetched(core, fake_mail):
     assert resp.body["status"] == "blocked"
     assert isinstance(blocked[0], ApprovalRejectedError)
     assert fake_mail.calls == [] and seen == []
+    _assert_receive_closed_failed(core)
 
 
 def test_sync_require_approval_polls_with_activity_id(core, fake_mail):

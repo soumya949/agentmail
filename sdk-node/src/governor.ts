@@ -6,6 +6,7 @@ import { isWrite, lookup, ActionClass, type ActionSpec } from "./catalog.ts";
 import { applyConstraints, ConstraintViolation } from "./constraints.ts";
 import { buildActivityInput, buildActivityOutput, buildInboundSignal, camelKeys, type AgentMailSettings } from "./contracts.ts";
 import { EVENT_SOURCE, OpenBoxClient, type EvaluationResult } from "./core.ts";
+import { stamp } from "./sequence.ts";
 import {
   AgentMailBlockedError,
   AgentMailHaltedError,
@@ -98,6 +99,45 @@ export class MailGovernor {
       throw new OpenBoxConfigError("approvalMode 'draft' requires an AgentMail client to stage drafts");
   }
 
+  /** Every governance event goes out stamped with its position in its run. */
+  private emit(event: Record<string, unknown>): Promise<EvaluationResult> {
+    return this.client.evaluate(stamp(event));
+  }
+
+  /**
+   * Close an activity with a failed ActivityCompleted on the SAME activity id.
+   * `activityInput` is set when the START was refused (block, halt,
+   * guardrail, unsatisfiable constraint, rejected approval): the closure then
+   * carries the facts it was refused on, or a policy re-evaluating it would
+   * see nothing to object to and the record would read BLOCK ... ALLOW.
+   * Best-effort: closure telemetry must never mask the original error.
+   */
+  private async closeFailed(
+    spec: ActionSpec,
+    activityId: string,
+    inboxId: string | null,
+    err: unknown,
+    activityInput?: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      await this.emit({
+        event_type: "ActivityCompleted",
+        ...this.workflowFields(),
+        task_queue: inboxId,
+        activity_id: activityId,
+        activity_type: spec.activityType,
+        ...(activityInput ? { activity_input: activityInput } : {}),
+        // NOT a top-level `error`: Core rejects such an ActivityCompleted with
+        // HTTP 400 and drops the whole event, so the failure is never recorded.
+        failed: true,
+        status: "failed",
+        activity_output: { action: spec.action, status: "failed", error: errorText(err) },
+        source: EVENT_SOURCE,
+        ...this.baseExtra(inboxId),
+      });
+    } catch { /* telemetry */ }
+  }
+
   get halted(): boolean {
     return this._halted;
   }
@@ -127,7 +167,7 @@ export class MailGovernor {
     this.workflowId = randomUUID();
     this.runId = randomUUID();
     this._halted = false;
-    await this.client.evaluate({
+    await this.emit({
       event_type: "WorkflowStarted",
       ...this.workflowFields(),
       source: EVENT_SOURCE,
@@ -147,7 +187,7 @@ export class MailGovernor {
     };
     this.workflowId = this.runId = null;
     try {
-      await this.client.evaluate(ev);
+      await this.emit(ev);
     } catch {
       /* telemetry must never break close */
     }
@@ -180,7 +220,7 @@ export class MailGovernor {
 
   private async emitResume(activityId: string, decision: string, reason: string | null) {
     try {
-      await this.client.evaluate({
+      await this.emit({
         event_type: "SignalReceived",
         ...this.workflowFields(),
         signal_name: "approval_resume",
@@ -310,7 +350,7 @@ export class MailGovernor {
     const activityId = randomUUID();
     const inboxId = args.inbox_id ? String(args.inbox_id) : null;
 
-    const r1 = await this.client.evaluate({
+    const r1 = await this.emit({
       event_type: "ActivityStarted",
       ...this.workflowFields(),
       task_queue: inboxId,
@@ -320,66 +360,59 @@ export class MailGovernor {
       source: EVENT_SOURCE,
       ...this.baseExtra(inboxId),
     });
-    this.enforceStarted(spec, r1);
-    this.checkFallback(spec, r1);
+    let execArgs: Record<string, unknown>;
+    try {
+      this.enforceStarted(spec, r1);
+      this.checkFallback(spec, r1);
 
-    let execArgs = this.redactArgs(args, r1);
-    const needsApproval = r1.verdict === "require_approval";
-    if (r1.verdict === "constrain" && isWrite(spec.actionClass)) {
-      // A CONSTRAIN we cannot apply must fail closed HERE. It must not fall
-      // through to the approval poll: Core registers an approval for
-      // REQUIRE_APPROVAL only, so polling on CONSTRAIN waits on an approval
-      // that will never exist — and with maxWaitMs unset that hangs forever.
-      if (!r1.constraints?.length)
-        throw new AgentMailBlockedError(
-          `policy returned CONSTRAIN for ${spec.activityType} without any constraints, so there is ` +
-            "nothing to apply and the call cannot be made compliant. Use REQUIRE APPROVAL or BLOCK instead",
-          spec.activityType,
-          r1.policyId ?? null,
-        );
-      try {
-        [execArgs] = applyConstraints(execArgs, r1.constraints);
-      } catch (e) {
-        if (!(e instanceof ConstraintViolation)) throw e;
-        throw new AgentMailBlockedError(
-          `policy returned CONSTRAIN for ${spec.activityType} but it could not be satisfied: ${e.message}`,
-          spec.activityType,
-          r1.policyId ?? null,
-        );
+      execArgs = this.redactArgs(args, r1);
+      const needsApproval = r1.verdict === "require_approval";
+      if (r1.verdict === "constrain" && isWrite(spec.actionClass)) {
+        // A CONSTRAIN we cannot apply must fail closed HERE. It must not fall
+        // through to the approval poll: Core registers an approval for
+        // REQUIRE_APPROVAL only, so polling on CONSTRAIN waits on an approval
+        // that will never exist — and with maxWaitMs unset that hangs forever.
+        if (!r1.constraints?.length)
+          throw new AgentMailBlockedError(
+            `policy returned CONSTRAIN for ${spec.activityType} without any constraints, so there is ` +
+              "nothing to apply and the call cannot be made compliant. Use REQUIRE APPROVAL or BLOCK instead",
+            spec.activityType,
+            r1.policyId ?? null,
+          );
+        try {
+          [execArgs] = applyConstraints(execArgs, r1.constraints);
+        } catch (e) {
+          if (!(e instanceof ConstraintViolation)) throw e;
+          throw new AgentMailBlockedError(
+            `policy returned CONSTRAIN for ${spec.activityType} but it could not be satisfied: ${e.message}`,
+            spec.activityType,
+            r1.policyId ?? null,
+          );
+        }
       }
-    }
 
-    if (needsApproval) {
-      if (defer && (this.settings.approvalMode ?? "wait") === "draft" && spec.actionClass === ActionClass.SEND)
-        return this.deferToDraft(spec, execArgs, r1, activityId);
-      if (!this.hitlSkips(spec)) await this.waitApproval(r1, activityId);
+      if (needsApproval) {
+        if (defer && (this.settings.approvalMode ?? "wait") === "draft" && spec.actionClass === ActionClass.SEND)
+          return this.deferToDraft(spec, execArgs, r1, activityId);
+        if (!this.hitlSkips(spec)) await this.waitApproval(r1, activityId);
+      }
+    } catch (e) {
+      // The start was refused: close it, so every started activity completes.
+      await this.closeFailed(spec, activityId, inboxId, e, activityInput);
+      throw e;
     }
 
     let result: any;
     try {
       result = await executor(execArgs);
     } catch (e) {
-      try {
-        await this.client.evaluate({
-          event_type: "ActivityCompleted",
-          ...this.workflowFields(),
-          task_queue: inboxId,
-          activity_id: activityId,
-          activity_type: spec.activityType,
-          // NOT a top-level `error`: Core rejects such an ActivityCompleted with
-          // HTTP 400 and drops the whole event, so the failure is never recorded.
-          failed: true,
-          activity_output: { action: spec.action, status: "failed", error: errorText(e) },
-          source: EVENT_SOURCE,
-          ...this.baseExtra(inboxId),
-        });
-      } catch { /* telemetry */ }
+      await this.closeFailed(spec, activityId, inboxId, e);
       throw e;
     }
 
     let r2: EvaluationResult | null = null;
     try {
-      r2 = await this.client.evaluate({
+      r2 = await this.emit({
         event_type: "ActivityCompleted",
         ...this.workflowFields(),
         task_queue: inboxId,
@@ -442,7 +475,7 @@ export class MailGovernor {
       ...fields,
       enforced: enforce,
     };
-    const r = await this.client.evaluate(ev);
+    const r = await this.emit(ev);
     if (!enforce) return [r, fields];
     if (r.verdict === "block" || r.verdict === "halt") {
       if (r.verdict === "halt") this._halted = true;
