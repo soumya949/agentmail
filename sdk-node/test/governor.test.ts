@@ -45,12 +45,30 @@ test("block: AgentMail never called, error carries reason", async () => {
   const { agent, mail } = makeAgent(core);
   await assert.rejects(() => agent.inboxes.messages.send("inbox_1", SEND_ARGS), AgentMailBlockedError);
   assert.equal(mail.calls.length, 0);
+  // A started activity is always completed: the block closes it as failed.
+  assert.deepEqual(core.lifecycle().map((p) => p.event_type), ["WorkflowStarted", "ActivityStarted", "ActivityCompleted"]);
+  assertClosedFailed(core, /external sends denied/);
 });
+
+/** The refused activity is closed by a failed ActivityCompleted on the SAME
+ *  activity id, carrying the input it was refused on and the reason. */
+function assertClosedFailed(core: FakeCore, reason?: RegExp) {
+  const started = core.lifecycle().filter((p) => p.event_type === "ActivityStarted").at(-1);
+  const closing = core.lifecycle().filter(
+    (p) => p.event_type === "ActivityCompleted" && p.activity_id === started.activity_id,
+  );
+  assert.equal(closing.length, 1);
+  assert.equal(closing[0].status, "failed");
+  assert.equal(closing[0].activity_output.status, "failed");
+  assert.deepEqual(closing[0].activity_input, started.activity_input);
+  if (reason) assert.match(closing[0].activity_output.error, reason);
+}
 
 test("halt: stops the session and short-circuits later calls locally", async () => {
   const core = new FakeCore({}, { verdict: "halt", reason: "kill" });
   const { agent, mail } = makeAgent(core);
   await assert.rejects(() => agent.inboxes.messages.send("inbox_1", SEND_ARGS), AgentMailHaltedError);
+  assertClosedFailed(core, /kill/);
   const before = core.payloads.length;
   await assert.rejects(() => agent.inboxes.messages.list("inbox_1"), AgentMailHaltedError);
   assert.equal(core.payloads.length, before); // no new wire traffic
@@ -72,6 +90,7 @@ test("require_approval rejected: no call, resume says rejected", async () => {
   await assert.rejects(() => agent.inboxes.messages.send("inbox_1", SEND_ARGS), ApprovalRejectedError);
   assert.equal(mail.calls.length, 0);
   assert.equal(core.payloads.find((p) => p.signal_name === "approval_resume").decision, "rejected");
+  assertClosedFailed(core);
 });
 
 test("draft mode: send defers to draft, resolves to governed send", async () => {
@@ -133,6 +152,7 @@ test("constrain violation fails closed and never polls", async () => {
   );
   assert.equal(core.approvalRequests.length, 0, "must not poll for an approval Core never registers");
   assert.equal(mail.calls.length, 0, "AgentMail must not be called");
+  assertClosedFailed(core, /could not be satisfied/);
 });
 
 test("bare constrain fails closed and never polls", async () => {
@@ -230,4 +250,16 @@ test("close emits WorkflowCompleted", async () => {
   await agent.inboxes.messages.send("inbox_1", SEND_ARGS);
   await agent.close();
   assert.equal(core.payloads[core.payloads.length - 1].event_type, "WorkflowCompleted");
+});
+
+test("events carry a strictly increasing sequence and timestamps per run", async () => {
+  const core = new FakeCore();
+  const { agent } = makeAgent(core);
+  await agent.inboxes.messages.send("inbox_1", SEND_ARGS);
+  await agent.inboxes.messages.send("inbox_1", SEND_ARGS);
+  const evs = core.lifecycle();
+  assert.deepEqual(evs.map((e) => e.sequence), evs.map((_, i) => i + 1));
+  const stamps = evs.map((e) => e.timestamp);
+  assert.deepEqual([...stamps].sort(), stamps);
+  assert.equal(new Set(stamps).size, stamps.length);
 });

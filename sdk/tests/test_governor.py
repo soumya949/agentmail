@@ -5,6 +5,7 @@ from conftest import INBOUND_EVENT, make_agent
 from openbox_core.conformance.fake_core import FakeCore
 from openbox_core.errors import ApprovalRejectedError, GuardrailsValidationError
 
+from openbox_agentmail.catalog import lookup
 from openbox_agentmail.config import AgentMailSettings
 from openbox_agentmail.errors import (
     AgentMailBlockedError,
@@ -56,8 +57,40 @@ def test_block_prevents_call(core, fake_mail):
         agent.inboxes.messages.send(**SEND)
     assert ei.value.policy_id == "p_1"
     assert fake_mail.calls == []
-    # WorkflowStarted evaluated (default allow), ActivityStarted blocked, no completed
-    assert _events(core) == ["WorkflowStarted", "ActivityStarted"]
+    # A started activity is always completed: the block closes it as failed.
+    assert _events(core) == ["WorkflowStarted", "ActivityStarted", "ActivityCompleted"]
+    _assert_closed_failed(core, "external recipient")
+
+
+def _assert_closed_failed(core: FakeCore, reason: str | None = None) -> None:
+    """The refused activity is closed by a failed ActivityCompleted on the SAME
+    activity id, carrying the input it was refused on and the reason."""
+    started = [p for p in core.lifecycle_payloads if p.get("event_type") == "ActivityStarted"][-1]
+    closing = [p for p in core.lifecycle_payloads
+               if p.get("event_type") == "ActivityCompleted"
+               and p.get("activity_id") == started["activity_id"]]
+    assert len(closing) == 1
+    done = closing[0]
+    assert done["status"] == "failed"
+    assert done["activity_output"]["status"] == "failed"
+    assert done["activity_input"] == started["activity_input"]
+    if reason is not None:
+        assert reason in done["activity_output"]["error"]
+
+
+async def test_async_block_closes_activity(core, fake_mail):
+    core.queue.extend([{}, {"verdict": "block", "reason": "external recipient"}])
+    agent, _ = make_agent(core, mail=fake_mail)
+    with pytest.raises(AgentMailBlockedError):
+        await agent.governor.arun(
+            lookup(("messages", "send")), SEND, lambda a: _never(),
+        )
+    assert _events(core) == ["WorkflowStarted", "ActivityStarted", "ActivityCompleted"]
+    _assert_closed_failed(core, "external recipient")
+
+
+async def _never():
+    raise AssertionError("executor must not run when the start is refused")
 
 
 def test_halt_stops_session(core, fake_mail):
@@ -65,6 +98,7 @@ def test_halt_stops_session(core, fake_mail):
     agent, _ = make_agent(core, mail=fake_mail)
     with pytest.raises(AgentMailHaltedError):
         agent.inboxes.messages.send(**SEND)
+    _assert_closed_failed(core, "kill")
     # subsequent calls short-circuit locally — no further evaluations
     n = len(core.payloads)
     with pytest.raises(AgentMailHaltedError):
@@ -98,6 +132,7 @@ def test_require_approval_rejected_blocks_call(core, fake_mail):
     with pytest.raises(ApprovalRejectedError):
         agent.inboxes.messages.send(**SEND)
     assert fake_mail.calls == []
+    _assert_closed_failed(core)
 
 
 def test_require_approval_no_approval_id_still_polls(core, fake_mail):
@@ -131,6 +166,7 @@ def test_bare_constrain_on_write_fails_closed_without_polling(core, fake_mail):
         agent.inboxes.messages.send(**SEND)
     assert core.approval_requests == []  # the hang regression
     assert mail.calls == []
+    _assert_closed_failed(core, "without any constraints")
 
 
 def test_constrain_on_read_proceeds(core, fake_mail):
@@ -169,6 +205,7 @@ def test_guardrail_failure_raises_before_call(core, fake_mail):
     with pytest.raises(GuardrailsValidationError):
         agent.inboxes.messages.send(**SEND)
     assert fake_mail.calls == []
+    _assert_closed_failed(core, "pii detected")
 
 
 def test_output_redaction_on_read(core, fake_mail):
@@ -318,3 +355,28 @@ def test_inbound_telemetry_only_status_events(core, fake_mail):
         , enforce=False
     )
     assert result.verdict.value == "allow"
+
+
+# ── event sequencing ─────────────────────────────────────────────────────────
+
+
+def test_events_carry_strictly_increasing_sequence_and_timestamps(core, fake_mail):
+    """Core orders a session by timestamp; events built within one millisecond
+    must still sort in emission order, and carry an explicit sequence number."""
+    agent, _ = make_agent(core, mail=fake_mail)
+    agent.inboxes.messages.send(**SEND)
+    agent.inboxes.messages.send(**SEND)
+    agent.close()
+    evs = core.lifecycle_payloads
+    assert [e["sequence"] for e in evs] == list(range(1, len(evs) + 1))
+    stamps = [e["timestamp"] for e in evs]
+    assert stamps == sorted(stamps) and len(set(stamps)) == len(stamps)
+
+
+def test_sequence_restarts_for_a_new_session(core, fake_mail):
+    agent, _ = make_agent(core, mail=fake_mail)
+    agent.inboxes.messages.send(**SEND)
+    agent.governor.close_session()
+    agent.inboxes.messages.send(**SEND)
+    seqs = [e["sequence"] for e in core.lifecycle_payloads]
+    assert seqs == [1, 2, 3, 4, 1, 2, 3]

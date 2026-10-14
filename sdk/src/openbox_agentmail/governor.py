@@ -59,6 +59,7 @@ from .contracts import (
 )
 from .errors import AgentMailBlockedError, AgentMailHaltedError, InboundFetchError
 from .redaction import redact_args, redact_result
+from .sequence import stamp as stamp_sequence
 
 __all__ = ["MailGovernor", "GovernedResult", "ReceivedMessage"]
 
@@ -248,8 +249,15 @@ class MailGovernor:
         )
         return ctx, _tag(started)
 
-    def _completed_event(self, ctx: ActivityContext, spec: ActionSpec, result: Any = None, error: str | None = None) -> events.EventEnvelope:
+    def _completed_event(self, ctx: ActivityContext, spec: ActionSpec, result: Any = None,
+                         error: str | None = None, *, refused: bool = False) -> events.EventEnvelope:
         extra = dict(ctx.metadata)
+        if refused:
+            # A refused start closes on the SAME facts it was refused on. Without
+            # activity_input the closure is re-evaluated against nothing a policy
+            # can object to, and the record reads BLOCK ... ALLOW for one
+            # activity in which nothing changed.
+            extra["activity_input"] = ctx.activity_input
         if error is None:
             extra["activity_output"] = build_activity_output(
                 spec, result, self.settings, self.runtime.config.privacy.max_body_size
@@ -262,6 +270,7 @@ class MailGovernor:
             # failure inside activity_output, which Core accepts. Revert to the
             # factory's ``error=`` once Core accepts it.
             extra["failed"] = True
+            extra["status"] = "failed"
             extra["activity_output"] = {
                 "action": spec.action,
                 "status": "failed",
@@ -275,6 +284,22 @@ class MailGovernor:
             extra=extra,
         )
         return _tag(ev)
+
+    def _close_refused(self, ctx: ActivityContext, spec: ActionSpec, e: BaseException) -> None:
+        """Close an activity whose start was refused (block, halt, guardrail,
+        unsatisfiable constraint, rejected/expired approval) with a failed
+        ActivityCompleted on the same activity id, so every started activity
+        is also completed. Best-effort: it must never mask the refusal."""
+        err = _error_text(e)
+        _swallow(lambda: self.runtime.gate.evaluate(self._completed_event(ctx, spec, error=err, refused=True)))
+
+    async def _aclose_refused(self, ctx: ActivityContext, spec: ActionSpec, e: BaseException) -> None:
+        try:
+            await self.runtime.gate.aevaluate(
+                self._completed_event(ctx, spec, error=_error_text(e), refused=True)
+            )
+        except Exception as e2:  # noqa: BLE001
+            logger.warning("ActivityCompleted(refused) not delivered: %s", e2)
 
     def _after_started(
         self, spec: ActionSpec, r1: EvaluationResult, args: dict[str, Any]
@@ -496,15 +521,20 @@ class MailGovernor:
         self.ensure_session()
         ctx, started = self._context_and_started(spec, activity_input, args.get("inbox_id"))
         with activity_scope(ctx, store=self.runtime.context_store):
-            r1 = self.runtime.evaluate_lifecycle(started)  # sync path returns REQUIRE_APPROVAL undriven
-            exec_args, applied = self._after_started(spec, r1, dict(args))
-            if applied:
-                ctx.metadata["applied_constraints"] = applied
-            if r1.verdict is Verdict.REQUIRE_APPROVAL:
-                if _defer and self._draft_eligible(spec):
-                    return self._defer_to_draft(spec, exec_args, r1, ctx)
-                if not self._hitl_skips(spec):
-                    self._wait_approval_sync(r1, ctx)
+            r1 = self.runtime.gate.evaluate(started)
+            try:
+                self._enforce_started(spec, r1)
+                exec_args, applied = self._after_started(spec, r1, dict(args))
+                if applied:
+                    ctx.metadata["applied_constraints"] = applied
+                if r1.verdict is Verdict.REQUIRE_APPROVAL:
+                    if _defer and self._draft_eligible(spec):
+                        return self._defer_to_draft(spec, exec_args, r1, ctx)
+                    if not self._hitl_skips(spec):
+                        self._wait_approval_sync(r1, ctx)
+            except Exception as e:
+                self._close_refused(ctx, spec, e)
+                raise
             try:
                 result = executor(exec_args)  # type: ignore[arg-type]
             except Exception as e:
@@ -527,15 +557,19 @@ class MailGovernor:
             # approval decision stays in this method: draft-mode defers instead
             # of polling, and approval_resume is emitted either way.
             r1 = await self.runtime.gate.aevaluate(started)
-            self._enforce_started(spec, r1)
-            exec_args, applied = self._after_started(spec, r1, dict(args))
-            if applied:
-                ctx.metadata["applied_constraints"] = applied
-            if r1.verdict is Verdict.REQUIRE_APPROVAL:
-                if _defer and self._draft_eligible(spec):
-                    return await self._adefer_to_draft(spec, exec_args, r1, ctx)
-                if not self._hitl_skips(spec):
-                    await self._wait_approval_async(r1, ctx)
+            try:
+                self._enforce_started(spec, r1)
+                exec_args, applied = self._after_started(spec, r1, dict(args))
+                if applied:
+                    ctx.metadata["applied_constraints"] = applied
+                if r1.verdict is Verdict.REQUIRE_APPROVAL:
+                    if _defer and self._draft_eligible(spec):
+                        return await self._adefer_to_draft(spec, exec_args, r1, ctx)
+                    if not self._hitl_skips(spec):
+                        await self._wait_approval_async(r1, ctx)
+            except Exception as e:
+                await self._aclose_refused(ctx, spec, e)
+                raise
             try:
                 result = await executor(exec_args)  # type: ignore[arg-type]
             except Exception as e:
@@ -776,10 +810,15 @@ class MailGovernor:
         self.ensure_session()
         ctx, started = self._context_and_started(spec, fields, fields["inbox_id"])
         with activity_scope(ctx, store=self.runtime.context_store):
-            r1 = self.runtime.evaluate_lifecycle(started)  # raises on stop verdicts / guardrails
-            self._check_fallback(spec, r1)
-            if self._receive_needs_approval(r1):
-                self._wait_approval_sync(r1, ctx)
+            r1 = self.runtime.gate.evaluate(started)
+            try:
+                self._enforce_started(spec, r1)
+                self._check_fallback(spec, r1)
+                if self._receive_needs_approval(r1):
+                    self._wait_approval_sync(r1, ctx)
+            except Exception as e:
+                self._close_refused(ctx, spec, e)
+                raise
             try:
                 fetched = get(inbox_id=fields["inbox_id"], message_id=fields["message_id"])
             except Exception as e:
@@ -803,10 +842,14 @@ class MailGovernor:
         ctx, started = self._context_and_started(spec, fields, fields["inbox_id"])
         with activity_scope(ctx, store=self.runtime.context_store):
             r1 = await self.runtime.gate.aevaluate(started)
-            self._enforce_started(spec, r1)
-            self._check_fallback(spec, r1)
-            if self._receive_needs_approval(r1):
-                await self._wait_approval_async(r1, ctx)
+            try:
+                self._enforce_started(spec, r1)
+                self._check_fallback(spec, r1)
+                if self._receive_needs_approval(r1):
+                    await self._wait_approval_async(r1, ctx)
+            except Exception as e:
+                await self._aclose_refused(ctx, spec, e)
+                raise
             kw = {"inbox_id": fields["inbox_id"], "message_id": fields["message_id"]}
             try:
                 if inspect.iscoroutinefunction(get):
@@ -879,14 +922,23 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 
 def _tag(ev: events.EventEnvelope) -> events.EventEnvelope:
+    """Set the AgentMail source and the event's position in its run (see
+    ``sequence``): a strictly increasing timestamp plus a ``sequence`` number."""
+    payload = ev.payload
+    timestamp = ev.timestamp
+    event_type = getattr(ev.event_type, "value", ev.event_type)
+    ts, seq = stamp_sequence(payload.get("run_id"), str(event_type))
+    if seq is not None:
+        payload = {**payload, "sequence": seq}
+        timestamp = timestamp or ts
     return events.EventEnvelope(
         event_type=ev.event_type,
-        payload=ev.payload,
+        payload=payload,
         spans=ev.spans,
         hook_trigger=ev.hook_trigger,
         activity_id=ev.activity_id,
         activity_type=ev.activity_type,
-        timestamp=ev.timestamp,
+        timestamp=timestamp,
         source=EVENT_SOURCE,
     )
 
